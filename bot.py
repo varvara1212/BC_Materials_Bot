@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,14 +24,31 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 
 GROUP_ID = -5340906174
 
-# Назва самого файлу Google Таблиці
 TABLE_NAME = "облік документів"
-
-# Назва потрібного аркуша всередині таблиці
 WORKSHEET_NAME = "заявки матеріалів"
 
-# У твоїй таблиці заявки починаються із 7-го рядка
 FIRST_APPLICATION_ROW = 7
+
+
+# Колонки Google Таблиці
+COL_NUMBER = 1            # A — №
+COL_DATE = 2              # B — дата заявки
+COL_OBJECT = 3            # C — об'єкт
+COL_NAME = 4              # D — хто приймає
+COL_MATERIALS = 5         # E — опис
+COL_SUPPLIER = 6          # F — постачальник
+COL_INVOICE_NUMBER = 7    # G — № рахунку
+COL_AMOUNT = 8            # H — сума
+COL_PAID = 9              # I — оплачено
+COL_DELIVERED = 10        # J — доставлено
+COL_RECEIVED_DATE = 11    # K — дата отримання
+COL_DELIVERY_NOTE = 12    # L — накладна
+COL_COMMENT = 13          # M — коментар
+
+# Службові колонки
+COL_GROUP_MESSAGE_ID = 14 # N
+COL_USER_ID = 15          # O
+COL_STATUS = 16           # P
 
 
 # Стани розмови
@@ -44,11 +61,13 @@ FIRST_APPLICATION_ROW = 7
     EDIT_OBJECT,
     EDIT_MATERIALS,
     EDIT_COMMENT,
-) = range(8)
+    RECEIPT_NUMBER,
+    RECEIPT_FILE,
+) = range(10)
 
 
 # ============================================================
-# ПІДКЛЮЧЕННЯ ДО GOOGLE ТАБЛИЦІ
+# GOOGLE ТАБЛИЦЯ
 # ============================================================
 
 google_credentials = json.loads(
@@ -68,7 +87,6 @@ credentials = Credentials.from_service_account_info(
 google_client = gspread.authorize(credentials)
 
 spreadsheet = google_client.open(TABLE_NAME)
-
 worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 
@@ -80,12 +98,16 @@ main_keyboard = ReplyKeyboardMarkup(
     [
         ["➕ Нова заявка"],
         ["✏️ Редагувати останню заявку"],
+        ["📦 Товар отримано"],
     ],
     resize_keyboard=True,
 )
 
 skip_keyboard = ReplyKeyboardMarkup(
-    [["⏭️ Пропустити"], ["❌ Скасувати"]],
+    [
+        ["⏭️ Пропустити"],
+        ["❌ Скасувати"],
+    ],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -111,25 +133,17 @@ edit_keyboard = ReplyKeyboardMarkup(
 # ============================================================
 
 def get_current_time() -> str:
-    """Повертає поточні дату й час за Києвом."""
     return datetime.now(
         ZoneInfo("Europe/Kyiv")
     ).strftime("%d.%m.%Y %H:%M")
 
 
 def get_next_application_number() -> int:
-    """
-    Знаходить найбільший номер заявки в колонці A
-    та повертає наступний.
-    """
-    values = worksheet.col_values(1)
+    values = worksheet.col_values(COL_NUMBER)
 
     numbers = []
 
     for value in values[FIRST_APPLICATION_ROW - 1:]:
-        if not value:
-            continue
-
         cleaned_value = (
             str(value)
             .replace("№", "")
@@ -137,28 +151,26 @@ def get_next_application_number() -> int:
             .strip()
         )
 
+        if not cleaned_value:
+            continue
+
         try:
             numbers.append(int(float(cleaned_value)))
         except ValueError:
             continue
 
-    if not numbers:
-        return 1
-
-    return max(numbers) + 1
+    return max(numbers) + 1 if numbers else 1
 
 
 def create_telegram_text(
-    application_number: int,
-    name: str,
-    obj: str,
-    materials: str,
-    comment: str,
-    application_date: str,
-    status: str = "Нова",
-) -> str:
-    """Створює текст заявки для Telegram-групи."""
-
+    application_number,
+    name,
+    obj,
+    materials,
+    comment,
+    application_date,
+    status="Нова",
+):
     return (
         f"📥 ЗАЯВКА №{application_number}\n\n"
         f"📌 Статус: {status}\n\n"
@@ -170,18 +182,53 @@ def create_telegram_text(
     )
 
 
-def find_last_user_application(
-    telegram_user_id: int,
-):
-    """
-    Знаходить останню нову заявку конкретного працівника.
+def find_application_by_number(application_number: str):
+    all_values = worksheet.get_all_values()
 
-    Службові колонки:
-    L — ID повідомлення в Telegram-групі
-    M — Telegram ID працівника
-    N — статус заявки
-    """
+    searched_number = (
+        str(application_number)
+        .replace("№", "")
+        .replace(" ", "")
+        .strip()
+    )
 
+    for row_number in range(
+        FIRST_APPLICATION_ROW,
+        len(all_values) + 1,
+    ):
+        row = all_values[row_number - 1]
+
+        if not row:
+            continue
+
+        saved_number = (
+            str(row[0])
+            .replace("№", "")
+            .replace(" ", "")
+            .strip()
+        )
+
+        if saved_number == searched_number:
+            while len(row) < COL_STATUS:
+                row.append("")
+
+            return {
+                "row_number": row_number,
+                "number": row[COL_NUMBER - 1],
+                "date": row[COL_DATE - 1],
+                "object": row[COL_OBJECT - 1],
+                "name": row[COL_NAME - 1],
+                "materials": row[COL_MATERIALS - 1],
+                "comment": row[COL_COMMENT - 1],
+                "message_id": row[COL_GROUP_MESSAGE_ID - 1],
+                "user_id": row[COL_USER_ID - 1],
+                "status": row[COL_STATUS - 1],
+            }
+
+    return None
+
+
+def find_last_user_application(telegram_user_id: int):
     all_values = worksheet.get_all_values()
 
     for row_number in range(
@@ -190,13 +237,11 @@ def find_last_user_application(
     ):
         row = all_values[row_number - 1]
 
-        # Доповнюємо рядок порожніми значеннями,
-        # якщо в ньому менше 14 колонок
-        while len(row) < 14:
+        while len(row) < COL_STATUS:
             row.append("")
 
-        saved_user_id = row[12].strip()
-        status = row[13].strip()
+        saved_user_id = row[COL_USER_ID - 1].strip()
+        status = row[COL_STATUS - 1].strip()
 
         if (
             saved_user_id == str(telegram_user_id)
@@ -204,67 +249,36 @@ def find_last_user_application(
         ):
             return {
                 "row_number": row_number,
-                "application_number": row[0],
-                "date": row[1],
-                "object": row[2],
-                "name": row[3],
-                "materials": row[4],
-                "comment": row[10],
-                "message_id": row[11],
-                "status": row[13],
+                "number": row[COL_NUMBER - 1],
             }
 
     return None
 
 
-async def show_main_menu(
-    update: Update,
-    text: str = "Оберіть дію:",
-):
-    """Показує головне меню."""
-
-    await update.message.reply_text(
-        text,
-        reply_markup=main_keyboard,
-    )
-
-
-async def update_group_message(
+async def update_group_message_by_row(
     context: ContextTypes.DEFAULT_TYPE,
+    row_number: int,
 ):
-    """Оновлює повідомлення заявки в Telegram-групі."""
-
-    row_number = context.user_data["edit_row"]
-
     row = worksheet.row_values(row_number)
 
-    while len(row) < 14:
+    while len(row) < COL_STATUS:
         row.append("")
 
-    application_number = row[0]
-    application_date = row[1]
-    obj = row[2]
-    name = row[3]
-    materials = row[4]
-    comment = row[10]
-    message_id = row[11]
-    status = row[13] or "Нова"
-
-    telegram_text = create_telegram_text(
-        application_number=application_number,
-        name=name,
-        obj=obj,
-        materials=materials,
-        comment=comment,
-        application_date=application_date,
-        status=status,
-    )
+    message_id = row[COL_GROUP_MESSAGE_ID - 1]
 
     if not message_id:
-        print(
-            "Не знайдено ID повідомлення для редагування."
-        )
+        print("Не знайдено ID повідомлення заявки.")
         return
+
+    telegram_text = create_telegram_text(
+        application_number=row[COL_NUMBER - 1],
+        name=row[COL_NAME - 1],
+        obj=row[COL_OBJECT - 1],
+        materials=row[COL_MATERIALS - 1],
+        comment=row[COL_COMMENT - 1] or "Без коментаря",
+        application_date=row[COL_DATE - 1],
+        status=row[COL_STATUS - 1] or "Нова",
+    )
 
     try:
         await context.bot.edit_message_text(
@@ -272,29 +286,22 @@ async def update_group_message(
             message_id=int(message_id),
             text=telegram_text,
         )
-
     except Exception as error:
-        print(
-            f"Помилка оновлення повідомлення "
-            f"в Telegram: {error}"
-        )
+        print(f"Помилка оновлення заявки в групі: {error}")
 
 
 # ============================================================
-# СТВОРЕННЯ НОВОЇ ЗАЯВКИ
+# НОВА ЗАЯВКА
 # ============================================================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Запуск через команду /start."""
-
     context.user_data.clear()
 
     await update.message.reply_text(
-        "👋 Вітаю!\n\n"
-        "Введіть ваше ПІБ або ім'я:",
+        "👋 Вітаю!\n\nВведіть ваше ПІБ або ім'я:",
         reply_markup=cancel_keyboard,
     )
 
@@ -305,8 +312,6 @@ async def new_application(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Запуск нової заявки через кнопку."""
-
     context.user_data.clear()
 
     await update.message.reply_text(
@@ -348,8 +353,7 @@ async def get_object(
     context.user_data["object"] = text
 
     await update.message.reply_text(
-        "📦 Напишіть матеріали та кількість "
-        "одним повідомленням.\n\n"
+        "📦 Напишіть матеріали та кількість одним повідомленням.\n\n"
         "Наприклад:\n"
         "Газоблок — 50 шт\n"
         "Клей — 8 мішків",
@@ -371,8 +375,7 @@ async def get_materials(
     context.user_data["materials"] = text
 
     await update.message.reply_text(
-        "💬 Напишіть коментар до заявки "
-        "або натисніть «⏭️ Пропустити»:",
+        "💬 Напишіть коментар або натисніть «⏭️ Пропустити»:",
         reply_markup=skip_keyboard,
     )
 
@@ -397,24 +400,22 @@ async def get_comment(
 
     application_number = get_next_application_number()
     current_time = get_current_time()
-
     status = "Нова"
 
     telegram_text = create_telegram_text(
-        application_number=application_number,
-        name=name,
-        obj=obj,
-        materials=materials,
-        comment=comment,
-        application_date=current_time,
-        status=status,
+        application_number,
+        name,
+        obj,
+        materials,
+        comment,
+        current_time,
+        status,
     )
 
     telegram_sent = False
     table_saved = False
     group_message_id = ""
 
-    # Спочатку відправляємо повідомлення в групу
     try:
         sent_message = await context.bot.send_message(
             chat_id=GROUP_ID,
@@ -425,11 +426,8 @@ async def get_comment(
         telegram_sent = True
 
     except Exception as error:
-        print(
-            f"Помилка відправлення в Telegram: {error}"
-        )
+        print(f"Помилка відправлення в Telegram: {error}")
 
-    # Потім додаємо заявку у 7-й рядок таблиці
     try:
         new_row = [
             application_number,          # A — №
@@ -442,10 +440,12 @@ async def get_comment(
             "",                          # H — сума
             False,                       # I — оплачено
             False,                       # J — доставлено
-            comment,                     # K — коментар
-            group_message_id,            # L — Telegram message ID
-            update.effective_user.id,    # M — Telegram user ID
-            status,                      # N — статус
+            "",                          # K — дата отримання
+            "",                          # L — накладна
+            comment,                     # M — коментар
+            group_message_id,            # N — message ID заявки
+            update.effective_user.id,    # O — Telegram user ID
+            status,                      # P — статус
         ]
 
         worksheet.insert_row(
@@ -457,34 +457,25 @@ async def get_comment(
         table_saved = True
 
     except Exception as error:
-        print(
-            f"Помилка запису в Google Таблицю: {error}"
-        )
+        print(f"Помилка запису в Google Таблицю: {error}")
 
     if telegram_sent and table_saved:
         answer = (
             f"✅ Заявку №{application_number} створено.\n\n"
-            "Вона відправлена в групу та записана "
-            "в Google Таблицю."
+            "Вона відправлена в групу та записана в таблицю."
         )
-
-    elif telegram_sent and not table_saved:
+    elif telegram_sent:
         answer = (
             "⚠️ Заявку відправлено в групу, "
-            "але не вдалося записати в Google Таблицю."
+            "але не записано в таблицю."
         )
-
-    elif not telegram_sent and table_saved:
+    elif table_saved:
         answer = (
-            "⚠️ Заявку записано в Google Таблицю, "
-            "але не вдалося відправити в групу."
+            "⚠️ Заявку записано в таблицю, "
+            "але не відправлено в групу."
         )
-
     else:
-        answer = (
-            "❌ Не вдалося відправити заявку. "
-            "Спробуйте ще раз."
-        )
+        answer = "❌ Не вдалося створити заявку."
 
     context.user_data.clear()
 
@@ -497,58 +488,31 @@ async def get_comment(
 
 
 # ============================================================
-# РЕДАГУВАННЯ ЗАЯВКИ
+# РЕДАГУВАННЯ
 # ============================================================
 
 async def edit_last_application(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Знаходить останню заявку працівника."""
-
     context.user_data.clear()
 
-    user_id = update.effective_user.id
-
-    try:
-        application = find_last_user_application(
-            telegram_user_id=user_id
-        )
-
-    except Exception as error:
-        print(
-            f"Помилка пошуку заявки: {error}"
-        )
-
-        await update.message.reply_text(
-            "❌ Не вдалося знайти заявку в таблиці.",
-            reply_markup=main_keyboard,
-        )
-
-        return ConversationHandler.END
+    application = find_last_user_application(
+        update.effective_user.id
+    )
 
     if not application:
         await update.message.reply_text(
-            "У вас немає нової заявки, "
-            "яку можна редагувати.\n\n"
-            "Редагувати можна лише останню заявку "
-            "зі статусом «Нова».",
+            "У вас немає нової заявки, яку можна редагувати.",
             reply_markup=main_keyboard,
         )
-
         return ConversationHandler.END
 
-    context.user_data["edit_row"] = (
-        application["row_number"]
-    )
-
-    context.user_data["edit_number"] = (
-        application["application_number"]
-    )
+    context.user_data["edit_row"] = application["row_number"]
+    context.user_data["edit_number"] = application["number"]
 
     await update.message.reply_text(
-        f"✏️ Редагування заявки "
-        f"№{application['application_number']}.\n\n"
+        f"✏️ Редагування заявки №{application['number']}.\n\n"
         "Що потрібно змінити?",
         reply_markup=edit_keyboard,
     )
@@ -567,47 +531,31 @@ async def edit_choice(
             "Введіть нову назву об'єкта:",
             reply_markup=cancel_keyboard,
         )
-
         return EDIT_OBJECT
 
     if choice == "📦 Змінити матеріали":
         await update.message.reply_text(
-            "Напишіть новий перелік матеріалів "
-            "та кількість:",
+            "Напишіть новий перелік матеріалів:",
             reply_markup=cancel_keyboard,
         )
-
         return EDIT_MATERIALS
 
     if choice == "💬 Змінити коментар":
         await update.message.reply_text(
-            "Напишіть новий коментар або натисніть "
-            "«⏭️ Пропустити»:",
+            "Напишіть новий коментар:",
             reply_markup=skip_keyboard,
         )
-
         return EDIT_COMMENT
 
     if choice == "✅ Завершити редагування":
-        application_number = context.user_data.get(
-            "edit_number",
-            "",
-        )
-
+        number = context.user_data.get("edit_number", "")
         context.user_data.clear()
 
         await update.message.reply_text(
-            f"✅ Редагування заявки "
-            f"№{application_number} завершено.",
+            f"✅ Редагування заявки №{number} завершено.",
             reply_markup=main_keyboard,
         )
-
         return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Оберіть потрібну дію кнопкою нижче:",
-        reply_markup=edit_keyboard,
-    )
 
     return EDIT_CHOICE
 
@@ -620,41 +568,28 @@ async def save_edited_object(
 
     if text == "❌ Скасувати":
         await update.message.reply_text(
-            "Зміну об'єкта скасовано.",
+            "Зміну скасовано.",
             reply_markup=edit_keyboard,
         )
-
         return EDIT_CHOICE
 
     row_number = context.user_data["edit_row"]
 
-    try:
-        # Оновлюємо лише колонку C
-        worksheet.update_cell(
-            row_number,
-            3,
-            text,
-        )
+    worksheet.update_cell(
+        row_number,
+        COL_OBJECT,
+        text,
+    )
 
-        await update_group_message(
-            context=context
-        )
+    await update_group_message_by_row(
+        context,
+        row_number,
+    )
 
-        await update.message.reply_text(
-            "✅ Об'єкт оновлено.\n\n"
-            "Що ще потрібно змінити?",
-            reply_markup=edit_keyboard,
-        )
-
-    except Exception as error:
-        print(
-            f"Помилка редагування об'єкта: {error}"
-        )
-
-        await update.message.reply_text(
-            "❌ Не вдалося оновити об'єкт.",
-            reply_markup=edit_keyboard,
-        )
+    await update.message.reply_text(
+        "✅ Об'єкт оновлено.",
+        reply_markup=edit_keyboard,
+    )
 
     return EDIT_CHOICE
 
@@ -667,41 +602,28 @@ async def save_edited_materials(
 
     if text == "❌ Скасувати":
         await update.message.reply_text(
-            "Зміну матеріалів скасовано.",
+            "Зміну скасовано.",
             reply_markup=edit_keyboard,
         )
-
         return EDIT_CHOICE
 
     row_number = context.user_data["edit_row"]
 
-    try:
-        # Оновлюємо лише колонку E
-        worksheet.update_cell(
-            row_number,
-            5,
-            text,
-        )
+    worksheet.update_cell(
+        row_number,
+        COL_MATERIALS,
+        text,
+    )
 
-        await update_group_message(
-            context=context
-        )
+    await update_group_message_by_row(
+        context,
+        row_number,
+    )
 
-        await update.message.reply_text(
-            "✅ Матеріали оновлено.\n\n"
-            "Що ще потрібно змінити?",
-            reply_markup=edit_keyboard,
-        )
-
-    except Exception as error:
-        print(
-            f"Помилка редагування матеріалів: {error}"
-        )
-
-        await update.message.reply_text(
-            "❌ Не вдалося оновити матеріали.",
-            reply_markup=edit_keyboard,
-        )
+    await update.message.reply_text(
+        "✅ Матеріали оновлено.",
+        reply_markup=edit_keyboard,
+    )
 
     return EDIT_CHOICE
 
@@ -714,10 +636,9 @@ async def save_edited_comment(
 
     if text == "❌ Скасувати":
         await update.message.reply_text(
-            "Зміну коментаря скасовано.",
+            "Зміну скасовано.",
             reply_markup=edit_keyboard,
         )
-
         return EDIT_CHOICE
 
     if text in ("⏭️ Пропустити", "-"):
@@ -725,35 +646,190 @@ async def save_edited_comment(
 
     row_number = context.user_data["edit_row"]
 
+    worksheet.update_cell(
+        row_number,
+        COL_COMMENT,
+        text,
+    )
+
+    await update_group_message_by_row(
+        context,
+        row_number,
+    )
+
+    await update.message.reply_text(
+        "✅ Коментар оновлено.",
+        reply_markup=edit_keyboard,
+    )
+
+    return EDIT_CHOICE
+
+
+# ============================================================
+# ТОВАР ОТРИМАНО
+# ============================================================
+
+async def receipt_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "📦 Введіть номер заявки, за якою отримано товар.\n\n"
+        "Наприклад: 320",
+        reply_markup=cancel_keyboard,
+    )
+
+    return RECEIPT_NUMBER
+
+
+async def receipt_get_number(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    application = find_application_by_number(text)
+
+    if not application:
+        await update.message.reply_text(
+            "❌ Заявку з таким номером не знайдено.\n\n"
+            "Перевірте номер і введіть його ще раз.",
+            reply_markup=cancel_keyboard,
+        )
+        return RECEIPT_NUMBER
+
+    if application["status"].lower() == "доставлено":
+        await update.message.reply_text(
+            f"ℹ️ Заявка №{application['number']} "
+            "вже має статус «Доставлено».",
+            reply_markup=main_keyboard,
+        )
+        return ConversationHandler.END
+
+    context.user_data["receipt_row"] = application["row_number"]
+    context.user_data["receipt_number"] = application["number"]
+    context.user_data["receipt_object"] = application["object"]
+    context.user_data["receipt_materials"] = application["materials"]
+    context.user_data["receipt_name"] = application["name"]
+
+    await update.message.reply_text(
+        f"✅ Заявку №{application['number']} знайдено.\n\n"
+        "Тепер надішліть фото накладної або файл PDF.",
+        reply_markup=cancel_keyboard,
+    )
+
+    return RECEIPT_FILE
+
+
+async def receipt_get_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message.text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    is_photo = bool(update.message.photo)
+    is_document = bool(update.message.document)
+
+    if not is_photo and not is_document:
+        await update.message.reply_text(
+            "Надішліть фото накладної або файл PDF.",
+            reply_markup=cancel_keyboard,
+        )
+        return RECEIPT_FILE
+
+    if is_document:
+        document = update.message.document
+
+        if document.mime_type != "application/pdf":
+            await update.message.reply_text(
+                "Потрібно надіслати фото або документ у форматі PDF.",
+                reply_markup=cancel_keyboard,
+            )
+            return RECEIPT_FILE
+
+    row_number = context.user_data["receipt_row"]
+    application_number = context.user_data["receipt_number"]
+    obj = context.user_data["receipt_object"]
+    materials = context.user_data["receipt_materials"]
+    name = context.user_data["receipt_name"]
+
+    received_time = get_current_time()
+
+    caption = (
+        f"📦 ТОВАР ОТРИМАНО\n\n"
+        f"🔢 Заявка №{application_number}\n"
+        f"🏗️ Об'єкт: {obj}\n"
+        f"👷 Прийняв: {name}\n"
+        f"📋 Матеріали: {materials}\n"
+        f"🕒 Дата отримання: {received_time}"
+    )
+
     try:
-        # Оновлюємо лише колонку K
-        worksheet.update_cell(
-            row_number,
-            11,
-            text,
+        copied_message = await context.bot.copy_message(
+            chat_id=GROUP_ID,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            caption=caption,
         )
 
-        await update_group_message(
-            context=context
+        delivery_note_value = (
+            f"Telegram, повідомлення №{copied_message.message_id}"
+        )
+
+        worksheet.update_cell(
+            row_number,
+            COL_DELIVERED,
+            True,
+        )
+
+        worksheet.update_cell(
+            row_number,
+            COL_RECEIVED_DATE,
+            received_time,
+        )
+
+        worksheet.update_cell(
+            row_number,
+            COL_DELIVERY_NOTE,
+            delivery_note_value,
+        )
+
+        worksheet.update_cell(
+            row_number,
+            COL_STATUS,
+            "Доставлено",
+        )
+
+        await update_group_message_by_row(
+            context,
+            row_number,
         )
 
         await update.message.reply_text(
-            "✅ Коментар оновлено.\n\n"
-            "Що ще потрібно змінити?",
-            reply_markup=edit_keyboard,
+            f"✅ Отримання товару за заявкою "
+            f"№{application_number} підтверджено.\n\n"
+            "Накладну відправлено в групу, "
+            "а в таблиці поставлено галочку «Доставлено».",
+            reply_markup=main_keyboard,
         )
 
     except Exception as error:
-        print(
-            f"Помилка редагування коментаря: {error}"
-        )
+        print(f"Помилка підтвердження отримання: {error}")
 
         await update.message.reply_text(
-            "❌ Не вдалося оновити коментар.",
-            reply_markup=edit_keyboard,
+            "❌ Не вдалося зберегти накладну або оновити таблицю.",
+            reply_markup=main_keyboard,
         )
 
-    return EDIT_CHOICE
+    context.user_data.clear()
+
+    return ConversationHandler.END
 
 
 # ============================================================
@@ -775,11 +851,10 @@ async def cancel(
 
 
 # ============================================================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # ============================================================
 
 app = Application.builder().token(TOKEN).build()
-
 
 conversation = ConversationHandler(
     entry_points=[
@@ -791,10 +866,13 @@ conversation = ConversationHandler(
         ),
 
         MessageHandler(
-            filters.Regex(
-                r"^✏️ Редагувати останню заявку$"
-            ),
+            filters.Regex(r"^✏️ Редагувати останню заявку$"),
             edit_last_application,
+        ),
+
+        MessageHandler(
+            filters.Regex(r"^📦 Товар отримано$"),
+            receipt_start,
         ),
     ],
 
@@ -854,6 +932,25 @@ conversation = ConversationHandler(
                 save_edited_comment,
             )
         ],
+
+        RECEIPT_NUMBER: [
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                receipt_get_number,
+            )
+        ],
+
+        RECEIPT_FILE: [
+            MessageHandler(
+                (
+                    filters.PHOTO
+                    | filters.Document.ALL
+                    | filters.TEXT
+                )
+                & ~filters.COMMAND,
+                receipt_get_file,
+            )
+        ],
     },
 
     fallbacks=[
@@ -863,11 +960,8 @@ conversation = ConversationHandler(
     allow_reentry=True,
 )
 
-
 app.add_handler(conversation)
 
-
 print("Бот запущено...")
-
 
 app.run_polling()
