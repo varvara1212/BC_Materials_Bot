@@ -1,7 +1,10 @@
+import json
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
+from google.oauth2.service_account import Credentials
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
@@ -12,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "ВСТАВ_ТОКЕН"
+TOKEN = os.environ["8970238893:AAHQ2BNuc6SVDXy-raJOc1Hgk7jKCadND7k"]
 
 GROUP_ID = -5340906174
 
@@ -21,9 +24,21 @@ TABLE_NAME = "Заявки на матеріали"
 NAME, OBJECT, MATERIALS, COMMENT = range(4)
 
 
-google_client = gspread.service_account(
-    filename="credentials.json"
+google_credentials = json.loads(
+    os.environ["GOOGLE_CREDENTIALS_JSON"]
 )
+
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+credentials = Credentials.from_service_account_info(
+    google_credentials,
+    scopes=scopes,
+)
+
+google_client = gspread.authorize(credentials)
 
 spreadsheet = google_client.open(TABLE_NAME)
 
@@ -129,7 +144,6 @@ async def get_comment(
             chat_id=GROUP_ID,
             text=telegram_text,
         )
-
         telegram_sent = True
 
     except Exception as error:
@@ -148,7 +162,6 @@ async def get_comment(
             ],
             value_input_option="USER_ENTERED",
         )
-
         table_saved = True
 
     except Exception as error:
