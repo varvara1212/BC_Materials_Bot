@@ -25,7 +25,7 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROUP_ID = -5340906174
 
 # Назва самого файлу Google Таблиці
-TABLE_NAME = "Заявки на матеріали"
+TABLE_NAME = "облік документів"
 
 # Назва потрібного аркуша всередині таблиці
 WORKSHEET_NAME = "заявки матеріалів"
