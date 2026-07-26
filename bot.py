@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.environ["8970238893:AAHQ2BNuc6SVDXy-raJOc1Hgk7jKCadND7k"]
+TOKEN = os.environ["TELEGRAM_TOKEN"]
 
 GROUP_ID = -5340906174
 
