@@ -27,6 +27,7 @@ GROUP_ID = -5340906174
 APPROVAL_GROUP_ID = int(os.environ["APPROVAL_GROUP_ID"])
 ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 APPROVER_USER_ID = int(os.environ["APPROVER_USER_ID"])
+PAYMENT_GROUP_ID = int(os.environ["PAYMENT_GROUP_ID"])
 
 TABLE_NAME = "облік документів"
 WORKSHEET_NAME = "заявки матеріалів"
@@ -48,11 +49,13 @@ COL_COMMENT = 13
 COL_GROUP_MESSAGE_ID = 14
 COL_USER_ID = 15
 COL_STATUS = 16
+COL_REQUIRED_DELIVERY_DATE = 17  # Q — потрібна дата доставки
 
 (
     NAME,
     OBJECT,
     MATERIALS,
+    DELIVERY_DATE,
     COMMENT,
     EDIT_CHOICE,
     EDIT_OBJECT,
@@ -65,7 +68,7 @@ COL_STATUS = 16
     INVOICE_NUMBER,
     INVOICE_AMOUNT,
     INVOICE_FILE,
-) = range(15)
+) = range(16)
 
 google_credentials = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
 
@@ -152,6 +155,7 @@ def create_telegram_text(
     materials,
     comment,
     application_date,
+    required_delivery_date="",
     status="Нова",
 ):
     return (
@@ -160,13 +164,14 @@ def create_telegram_text(
         f"👷 Хто приймає:\n{name}\n\n"
         f"🏗️ Об'єкт:\n{obj}\n\n"
         f"📦 Матеріали:\n{materials}\n\n"
+        f"📅 Потрібна доставка:\n{required_delivery_date or 'Не вказано'}\n\n"
         f"💬 Коментар:\n{comment}\n\n"
         f"🕒 Дата і час:\n{application_date}"
     )
 
 
 def make_application_dict(row_number: int, row: list) -> dict:
-    while len(row) < COL_STATUS:
+    while len(row) < COL_REQUIRED_DELIVERY_DATE:
         row.append("")
 
     return {
@@ -183,6 +188,7 @@ def make_application_dict(row_number: int, row: list) -> dict:
         "message_id": row[COL_GROUP_MESSAGE_ID - 1],
         "user_id": row[COL_USER_ID - 1],
         "status": row[COL_STATUS - 1],
+        "required_delivery_date": row[COL_REQUIRED_DELIVERY_DATE - 1],
     }
 
 
@@ -208,7 +214,7 @@ def find_last_user_application(telegram_user_id: int):
     for row_number in range(FIRST_APPLICATION_ROW, len(all_values) + 1):
         row = all_values[row_number - 1]
 
-        while len(row) < COL_STATUS:
+        while len(row) < COL_REQUIRED_DELIVERY_DATE:
             row.append("")
 
         saved_user_id = row[COL_USER_ID - 1].strip()
@@ -284,7 +290,7 @@ async def update_group_message_by_row(
 ):
     row = worksheet.row_values(row_number)
 
-    while len(row) < COL_STATUS:
+    while len(row) < COL_REQUIRED_DELIVERY_DATE:
         row.append("")
 
     message_id = row[COL_GROUP_MESSAGE_ID - 1]
@@ -299,6 +305,7 @@ async def update_group_message_by_row(
         row[COL_MATERIALS - 1],
         row[COL_COMMENT - 1] or "Без коментаря",
         row[COL_DATE - 1],
+        row[COL_REQUIRED_DELIVERY_DATE - 1],
         row[COL_STATUS - 1] or "Нова",
     )
 
@@ -376,6 +383,41 @@ async def get_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["materials"] = text
 
     await update.message.reply_text(
+        "📅 Вкажіть дату, на яку потрібна доставка.\n\n"
+        "Наприклад: 30.07.2026",
+        reply_markup=cancel_keyboard,
+    )
+
+    return DELIVERY_DATE
+
+
+async def get_delivery_date(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    try:
+        delivery_date = datetime.strptime(text, "%d.%m.%Y").date()
+        today = datetime.now(ZoneInfo("Europe/Kyiv")).date()
+
+        if delivery_date < today:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неправильна дата.\n\n"
+            "Введіть дату у форматі ДД.ММ.РРРР, "
+            "наприклад: 30.07.2026. Дата не може бути минулою.",
+            reply_markup=cancel_keyboard,
+        )
+        return DELIVERY_DATE
+
+    context.user_data["required_delivery_date"] = text
+
+    await update.message.reply_text(
         "💬 Напишіть коментар або натисніть «⏭️ Пропустити»:",
         reply_markup=skip_keyboard,
     )
@@ -395,6 +437,7 @@ async def get_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = context.user_data["name"]
     obj = context.user_data["object"]
     materials = context.user_data["materials"]
+    required_delivery_date = context.user_data["required_delivery_date"]
 
     application_number = get_next_application_number()
     current_time = get_current_time()
@@ -407,6 +450,7 @@ async def get_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         materials,
         comment,
         current_time,
+        required_delivery_date,
         status,
     )
 
@@ -444,6 +488,7 @@ async def get_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_message_id,
             update.effective_user.id,
             status,
+            required_delivery_date,
         ]
 
         worksheet.insert_row(
@@ -458,7 +503,7 @@ async def get_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Помилка запису в Google Таблицю: {error}")
 
     if telegram_sent and table_saved:
-        answer = f"✅ Заявку №{application_number} створено."
+        answer = f"✅ Дякуємо! Заявку №{application_number} створено."
     elif telegram_sent:
         answer = "⚠️ Заявку відправлено в групу, але не записано в таблицю."
     elif table_saved:
@@ -874,6 +919,10 @@ async def invoice_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier = context.user_data["invoice_supplier"]
     invoice_number = context.user_data["invoice_document_number"]
     requester_id = context.user_data.get("invoice_requester_id", "")
+    application = find_application_by_number(application_number)
+    required_delivery_date = (
+        application["required_delivery_date"] if application else ""
+    )
 
     amount = Decimal(context.user_data["invoice_amount"])
     amount_text = amount_for_message(amount)
@@ -883,6 +932,7 @@ async def invoice_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔢 Заявка №{application_number}\n"
         f"🏗️ Об'єкт: {obj}\n"
         f"📦 Матеріали: {materials}\n"
+        f"📅 Потрібна доставка: {required_delivery_date or 'Не вказано'}\n"
         f"🏪 Постачальник: {supplier}\n"
         f"📄 Рахунок №{invoice_number}\n"
         f"💰 Сума: {amount_text} грн\n\n"
@@ -1023,13 +1073,37 @@ async def invoice_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         old_caption = query.message.caption or ""
 
-        await query.edit_message_caption(
-            caption=(
-                f"{old_caption}\n\n"
-                f"{decision_text}\n"
-                f"👤 {query.from_user.full_name}\n"
+        final_caption = (
+            f"{old_caption}\n\n"
+            f"{decision_text}\n"
+            f"👤 {query.from_user.full_name}\n"
+            f"🕒 {get_current_time()}"
+        )
+
+        if action == "invoice_approve":
+            payment_caption = (
+                f"💳 ДО ОПЛАТИ\n\n"
+                f"🔢 Заявка №{application['number']}\n"
+                f"🏗️ Об'єкт: {application['object']}\n"
+                f"📦 Матеріали: {application['materials']}\n"
+                f"📅 Потрібна доставка: "
+                f"{application['required_delivery_date'] or 'Не вказано'}\n"
+                f"🏪 Постачальник: {application['supplier']}\n"
+                f"📄 Рахунок №{application['invoice_number']}\n"
+                f"💰 Сума: {application['amount']} грн\n\n"
+                f"✅ Погоджено керівником\n"
                 f"🕒 {get_current_time()}"
-            ),
+            )
+
+            await context.bot.copy_message(
+                chat_id=PAYMENT_GROUP_ID,
+                from_chat_id=APPROVAL_GROUP_ID,
+                message_id=query.message.message_id,
+                caption=payment_caption,
+            )
+
+        await query.edit_message_caption(
+            caption=final_caption,
             reply_markup=None,
         )
 
@@ -1096,6 +1170,9 @@ conversation = ConversationHandler(
         OBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_object)],
         MATERIALS: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, get_materials)
+        ],
+        DELIVERY_DATE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_delivery_date)
         ],
         COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_comment)],
         EDIT_CHOICE: [
