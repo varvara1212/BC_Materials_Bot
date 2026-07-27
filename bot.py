@@ -1,13 +1,20 @@
 import json
 import os
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -15,43 +22,33 @@ from telegram.ext import (
     filters,
 )
 
-
-# ============================================================
-# НАЛАШТУВАННЯ
-# ============================================================
-
 TOKEN = os.environ["TELEGRAM_TOKEN"]
-
 GROUP_ID = -5340906174
+APPROVAL_GROUP_ID = int(os.environ["APPROVAL_GROUP_ID"])
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
+APPROVER_USER_ID = int(os.environ["APPROVER_USER_ID"])
 
 TABLE_NAME = "облік документів"
 WORKSHEET_NAME = "заявки матеріалів"
-
 FIRST_APPLICATION_ROW = 7
 
+COL_NUMBER = 1
+COL_DATE = 2
+COL_OBJECT = 3
+COL_NAME = 4
+COL_MATERIALS = 5
+COL_SUPPLIER = 6
+COL_INVOICE_NUMBER = 7
+COL_AMOUNT = 8
+COL_PAID = 9
+COL_DELIVERED = 10
+COL_RECEIVED_DATE = 11
+COL_DELIVERY_NOTE = 12
+COL_COMMENT = 13
+COL_GROUP_MESSAGE_ID = 14
+COL_USER_ID = 15
+COL_STATUS = 16
 
-# Колонки Google Таблиці
-COL_NUMBER = 1            # A — №
-COL_DATE = 2              # B — дата заявки
-COL_OBJECT = 3            # C — об'єкт
-COL_NAME = 4              # D — хто приймає
-COL_MATERIALS = 5         # E — опис
-COL_SUPPLIER = 6          # F — постачальник
-COL_INVOICE_NUMBER = 7    # G — № рахунку
-COL_AMOUNT = 8            # H — сума
-COL_PAID = 9              # I — оплачено
-COL_DELIVERED = 10        # J — доставлено
-COL_RECEIVED_DATE = 11    # K — дата отримання
-COL_DELIVERY_NOTE = 12    # L — накладна
-COL_COMMENT = 13          # M — коментар
-
-# Службові колонки
-COL_GROUP_MESSAGE_ID = 14 # N
-COL_USER_ID = 15          # O
-COL_STATUS = 16           # P
-
-
-# Стани розмови
 (
     NAME,
     OBJECT,
@@ -63,16 +60,14 @@ COL_STATUS = 16           # P
     EDIT_COMMENT,
     RECEIPT_NUMBER,
     RECEIPT_FILE,
-) = range(10)
+    INVOICE_SELECT,
+    INVOICE_SUPPLIER,
+    INVOICE_NUMBER,
+    INVOICE_AMOUNT,
+    INVOICE_FILE,
+) = range(15)
 
-
-# ============================================================
-# GOOGLE ТАБЛИЦЯ
-# ============================================================
-
-google_credentials = json.loads(
-    os.environ["GOOGLE_CREDENTIALS_JSON"]
-)
+google_credentials = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
 
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -85,29 +80,25 @@ credentials = Credentials.from_service_account_info(
 )
 
 google_client = gspread.authorize(credentials)
-
 spreadsheet = google_client.open(TABLE_NAME)
 worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
 
-# ============================================================
-# КНОПКИ
-# ============================================================
-
-main_keyboard = ReplyKeyboardMarkup(
-    [
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    buttons = [
         ["➕ Нова заявка"],
         ["✏️ Редагувати останню заявку"],
         ["📦 Товар отримано"],
-    ],
-    resize_keyboard=True,
-)
+    ]
+
+    if user_id == ADMIN_USER_ID:
+        buttons.append(["🧾 Додати рахунок"])
+
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 
 skip_keyboard = ReplyKeyboardMarkup(
-    [
-        ["⏭️ Пропустити"],
-        ["❌ Скасувати"],
-    ],
+    [["⏭️ Пропустити"], ["❌ Скасувати"]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -128,28 +119,20 @@ edit_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# ============================================================
-# ДОПОМІЖНІ ФУНКЦІЇ
-# ============================================================
-
 def get_current_time() -> str:
-    return datetime.now(
-        ZoneInfo("Europe/Kyiv")
-    ).strftime("%d.%m.%Y %H:%M")
+    return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%d.%m.%Y %H:%M")
+
+
+def clean_number(value) -> str:
+    return str(value).replace("№", "").replace(" ", "").strip()
 
 
 def get_next_application_number() -> int:
     values = worksheet.col_values(COL_NUMBER)
-
     numbers = []
 
     for value in values[FIRST_APPLICATION_ROW - 1:]:
-        cleaned_value = (
-            str(value)
-            .replace("№", "")
-            .replace(" ", "")
-            .strip()
-        )
+        cleaned_value = clean_number(value)
 
         if not cleaned_value:
             continue
@@ -182,48 +165,39 @@ def create_telegram_text(
     )
 
 
+def make_application_dict(row_number: int, row: list) -> dict:
+    while len(row) < COL_STATUS:
+        row.append("")
+
+    return {
+        "row_number": row_number,
+        "number": row[COL_NUMBER - 1],
+        "date": row[COL_DATE - 1],
+        "object": row[COL_OBJECT - 1],
+        "name": row[COL_NAME - 1],
+        "materials": row[COL_MATERIALS - 1],
+        "supplier": row[COL_SUPPLIER - 1],
+        "invoice_number": row[COL_INVOICE_NUMBER - 1],
+        "amount": row[COL_AMOUNT - 1],
+        "comment": row[COL_COMMENT - 1],
+        "message_id": row[COL_GROUP_MESSAGE_ID - 1],
+        "user_id": row[COL_USER_ID - 1],
+        "status": row[COL_STATUS - 1],
+    }
+
+
 def find_application_by_number(application_number: str):
     all_values = worksheet.get_all_values()
+    searched_number = clean_number(application_number)
 
-    searched_number = (
-        str(application_number)
-        .replace("№", "")
-        .replace(" ", "")
-        .strip()
-    )
-
-    for row_number in range(
-        FIRST_APPLICATION_ROW,
-        len(all_values) + 1,
-    ):
+    for row_number in range(FIRST_APPLICATION_ROW, len(all_values) + 1):
         row = all_values[row_number - 1]
 
         if not row:
             continue
 
-        saved_number = (
-            str(row[0])
-            .replace("№", "")
-            .replace(" ", "")
-            .strip()
-        )
-
-        if saved_number == searched_number:
-            while len(row) < COL_STATUS:
-                row.append("")
-
-            return {
-                "row_number": row_number,
-                "number": row[COL_NUMBER - 1],
-                "date": row[COL_DATE - 1],
-                "object": row[COL_OBJECT - 1],
-                "name": row[COL_NAME - 1],
-                "materials": row[COL_MATERIALS - 1],
-                "comment": row[COL_COMMENT - 1],
-                "message_id": row[COL_GROUP_MESSAGE_ID - 1],
-                "user_id": row[COL_USER_ID - 1],
-                "status": row[COL_STATUS - 1],
-            }
+        if clean_number(row[COL_NUMBER - 1]) == searched_number:
+            return make_application_dict(row_number, row)
 
     return None
 
@@ -231,10 +205,7 @@ def find_application_by_number(application_number: str):
 def find_last_user_application(telegram_user_id: int):
     all_values = worksheet.get_all_values()
 
-    for row_number in range(
-        FIRST_APPLICATION_ROW,
-        len(all_values) + 1,
-    ):
+    for row_number in range(FIRST_APPLICATION_ROW, len(all_values) + 1):
         row = all_values[row_number - 1]
 
         while len(row) < COL_STATUS:
@@ -243,16 +214,68 @@ def find_last_user_application(telegram_user_id: int):
         saved_user_id = row[COL_USER_ID - 1].strip()
         status = row[COL_STATUS - 1].strip()
 
-        if (
-            saved_user_id == str(telegram_user_id)
-            and status.lower() == "нова"
-        ):
+        if saved_user_id == str(telegram_user_id) and status.lower() == "нова":
             return {
                 "row_number": row_number,
                 "number": row[COL_NUMBER - 1],
             }
 
     return None
+
+
+def get_open_applications(limit: int = 25) -> list:
+    all_values = worksheet.get_all_values()
+    applications = []
+
+    for row_number in range(FIRST_APPLICATION_ROW, len(all_values) + 1):
+        row = all_values[row_number - 1]
+
+        if not row:
+            continue
+
+        application = make_application_dict(row_number, row)
+        status = application["status"].strip().lower()
+
+        if status in {"", "нова", "відхилено"}:
+            applications.append(application)
+
+        if len(applications) >= limit:
+            break
+
+    return applications
+
+
+def parse_amount(text: str) -> Decimal:
+    cleaned = (
+        text.replace("грн", "")
+        .replace("₴", "")
+        .replace(" ", "")
+        .replace(",", ".")
+        .strip()
+    )
+
+    amount = Decimal(cleaned)
+
+    if amount <= 0:
+        raise InvalidOperation
+
+    return amount
+
+
+def amount_for_sheet(amount: Decimal):
+    if amount == amount.to_integral():
+        return int(amount)
+
+    return float(amount)
+
+
+def amount_for_message(amount: Decimal) -> str:
+    formatted = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+
+    if formatted.endswith(",00"):
+        formatted = formatted[:-3]
+
+    return formatted
 
 
 async def update_group_message_by_row(
@@ -267,51 +290,40 @@ async def update_group_message_by_row(
     message_id = row[COL_GROUP_MESSAGE_ID - 1]
 
     if not message_id:
-        print("Не знайдено ID повідомлення заявки.")
         return
 
-    telegram_text = create_telegram_text(
-        application_number=row[COL_NUMBER - 1],
-        name=row[COL_NAME - 1],
-        obj=row[COL_OBJECT - 1],
-        materials=row[COL_MATERIALS - 1],
-        comment=row[COL_COMMENT - 1] or "Без коментаря",
-        application_date=row[COL_DATE - 1],
-        status=row[COL_STATUS - 1] or "Нова",
+    text = create_telegram_text(
+        row[COL_NUMBER - 1],
+        row[COL_NAME - 1],
+        row[COL_OBJECT - 1],
+        row[COL_MATERIALS - 1],
+        row[COL_COMMENT - 1] or "Без коментаря",
+        row[COL_DATE - 1],
+        row[COL_STATUS - 1] or "Нова",
     )
 
     try:
         await context.bot.edit_message_text(
             chat_id=GROUP_ID,
             message_id=int(message_id),
-            text=telegram_text,
+            text=text,
         )
     except Exception as error:
         print(f"Помилка оновлення заявки в групі: {error}")
 
 
-# ============================================================
-# НОВА ЗАЯВКА
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "👋 Вітаю!\n\nВведіть ваше ПІБ або ім'я:",
-        reply_markup=cancel_keyboard,
+        "👋 Вітаю! Оберіть потрібну дію:",
+        reply_markup=get_main_keyboard(update.effective_user.id),
     )
 
-    return NAME
+    return ConversationHandler.END
 
 
-async def new_application(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def new_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
@@ -322,10 +334,7 @@ async def new_application(
     return NAME
 
 
-async def get_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
@@ -341,10 +350,7 @@ async def get_name(
     return OBJECT
 
 
-async def get_object(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def get_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
@@ -354,19 +360,14 @@ async def get_object(
 
     await update.message.reply_text(
         "📦 Напишіть матеріали та кількість одним повідомленням.\n\n"
-        "Наприклад:\n"
-        "Газоблок — 50 шт\n"
-        "Клей — 8 мішків",
+        "Наприклад:\nГазоблок — 50 шт\nКлей — 8 мішків",
         reply_markup=cancel_keyboard,
     )
 
     return MATERIALS
 
 
-async def get_materials(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def get_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
@@ -382,10 +383,7 @@ async def get_materials(
     return COMMENT
 
 
-async def get_comment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def get_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     comment = update.message.text.strip()
 
     if comment == "❌ Скасувати":
@@ -430,22 +428,22 @@ async def get_comment(
 
     try:
         new_row = [
-            application_number,          # A — №
-            current_time,                # B — дата заявки
-            obj,                         # C — об'єкт
-            name,                        # D — хто приймає
-            materials,                   # E — опис
-            "",                          # F — постачальник
-            "",                          # G — № рахунку
-            "",                          # H — сума
-            False,                       # I — оплачено
-            False,                       # J — доставлено
-            "",                          # K — дата отримання
-            "",                          # L — накладна
-            comment,                     # M — коментар
-            group_message_id,            # N — message ID заявки
-            update.effective_user.id,    # O — Telegram user ID
-            status,                      # P — статус
+            application_number,
+            current_time,
+            obj,
+            name,
+            materials,
+            "",
+            "",
+            "",
+            False,
+            False,
+            "",
+            "",
+            comment,
+            group_message_id,
+            update.effective_user.id,
+            status,
         ]
 
         worksheet.insert_row(
@@ -460,20 +458,11 @@ async def get_comment(
         print(f"Помилка запису в Google Таблицю: {error}")
 
     if telegram_sent and table_saved:
-        answer = (
-            f"✅ Заявку №{application_number} створено.\n\n"
-            "Вона відправлена в групу та записана в таблицю."
-        )
+        answer = f"✅ Заявку №{application_number} створено."
     elif telegram_sent:
-        answer = (
-            "⚠️ Заявку відправлено в групу, "
-            "але не записано в таблицю."
-        )
+        answer = "⚠️ Заявку відправлено в групу, але не записано в таблицю."
     elif table_saved:
-        answer = (
-            "⚠️ Заявку записано в таблицю, "
-            "але не відправлено в групу."
-        )
+        answer = "⚠️ Заявку записано в таблицю, але не відправлено в групу."
     else:
         answer = "❌ Не вдалося створити заявку."
 
@@ -481,30 +470,21 @@ async def get_comment(
 
     await update.message.reply_text(
         answer,
-        reply_markup=main_keyboard,
+        reply_markup=get_main_keyboard(update.effective_user.id),
     )
 
     return ConversationHandler.END
 
 
-# ============================================================
-# РЕДАГУВАННЯ
-# ============================================================
-
-async def edit_last_application(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def edit_last_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
-    application = find_last_user_application(
-        update.effective_user.id
-    )
+    application = find_last_user_application(update.effective_user.id)
 
     if not application:
         await update.message.reply_text(
             "У вас немає нової заявки, яку можна редагувати.",
-            reply_markup=main_keyboard,
+            reply_markup=get_main_keyboard(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -520,10 +500,7 @@ async def edit_last_application(
     return EDIT_CHOICE
 
 
-async def edit_choice(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text.strip()
 
     if choice == "🏗️ Змінити об'єкт":
@@ -553,141 +530,73 @@ async def edit_choice(
 
         await update.message.reply_text(
             f"✅ Редагування заявки №{number} завершено.",
-            reply_markup=main_keyboard,
+            reply_markup=get_main_keyboard(update.effective_user.id),
         )
         return ConversationHandler.END
 
     return EDIT_CHOICE
 
 
-async def save_edited_object(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def save_edited_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
-        await update.message.reply_text(
-            "Зміну скасовано.",
-            reply_markup=edit_keyboard,
-        )
+        await update.message.reply_text("Зміну скасовано.", reply_markup=edit_keyboard)
         return EDIT_CHOICE
 
     row_number = context.user_data["edit_row"]
+    worksheet.update_cell(row_number, COL_OBJECT, text)
+    await update_group_message_by_row(context, row_number)
 
-    worksheet.update_cell(
-        row_number,
-        COL_OBJECT,
-        text,
-    )
-
-    await update_group_message_by_row(
-        context,
-        row_number,
-    )
-
-    await update.message.reply_text(
-        "✅ Об'єкт оновлено.",
-        reply_markup=edit_keyboard,
-    )
-
+    await update.message.reply_text("✅ Об'єкт оновлено.", reply_markup=edit_keyboard)
     return EDIT_CHOICE
 
 
-async def save_edited_materials(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def save_edited_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
-        await update.message.reply_text(
-            "Зміну скасовано.",
-            reply_markup=edit_keyboard,
-        )
+        await update.message.reply_text("Зміну скасовано.", reply_markup=edit_keyboard)
         return EDIT_CHOICE
 
     row_number = context.user_data["edit_row"]
+    worksheet.update_cell(row_number, COL_MATERIALS, text)
+    await update_group_message_by_row(context, row_number)
 
-    worksheet.update_cell(
-        row_number,
-        COL_MATERIALS,
-        text,
-    )
-
-    await update_group_message_by_row(
-        context,
-        row_number,
-    )
-
-    await update.message.reply_text(
-        "✅ Матеріали оновлено.",
-        reply_markup=edit_keyboard,
-    )
-
+    await update.message.reply_text("✅ Матеріали оновлено.", reply_markup=edit_keyboard)
     return EDIT_CHOICE
 
 
-async def save_edited_comment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def save_edited_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
-        await update.message.reply_text(
-            "Зміну скасовано.",
-            reply_markup=edit_keyboard,
-        )
+        await update.message.reply_text("Зміну скасовано.", reply_markup=edit_keyboard)
         return EDIT_CHOICE
 
     if text in ("⏭️ Пропустити", "-"):
         text = "Без коментаря"
 
     row_number = context.user_data["edit_row"]
+    worksheet.update_cell(row_number, COL_COMMENT, text)
+    await update_group_message_by_row(context, row_number)
 
-    worksheet.update_cell(
-        row_number,
-        COL_COMMENT,
-        text,
-    )
-
-    await update_group_message_by_row(
-        context,
-        row_number,
-    )
-
-    await update.message.reply_text(
-        "✅ Коментар оновлено.",
-        reply_markup=edit_keyboard,
-    )
-
+    await update.message.reply_text("✅ Коментар оновлено.", reply_markup=edit_keyboard)
     return EDIT_CHOICE
 
 
-# ============================================================
-# ТОВАР ОТРИМАНО
-# ============================================================
-
-async def receipt_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "📦 Введіть номер заявки, за якою отримано товар.\n\n"
-        "Наприклад: 320",
+        "📦 Введіть номер заявки, за якою отримано товар.\n\nНаприклад: 320",
         reply_markup=cancel_keyboard,
     )
 
     return RECEIPT_NUMBER
 
 
-async def receipt_get_number(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receipt_get_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "❌ Скасувати":
@@ -697,17 +606,15 @@ async def receipt_get_number(
 
     if not application:
         await update.message.reply_text(
-            "❌ Заявку з таким номером не знайдено.\n\n"
-            "Перевірте номер і введіть його ще раз.",
+            "❌ Заявку з таким номером не знайдено.",
             reply_markup=cancel_keyboard,
         )
         return RECEIPT_NUMBER
 
     if application["status"].lower() == "доставлено":
         await update.message.reply_text(
-            f"ℹ️ Заявка №{application['number']} "
-            "вже має статус «Доставлено».",
-            reply_markup=main_keyboard,
+            f"ℹ️ Заявка №{application['number']} вже доставлена.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -719,17 +626,14 @@ async def receipt_get_number(
 
     await update.message.reply_text(
         f"✅ Заявку №{application['number']} знайдено.\n\n"
-        "Тепер надішліть фото накладної або файл PDF.",
+        "Надішліть фото накладної або PDF.",
         reply_markup=cancel_keyboard,
     )
 
     return RECEIPT_FILE
 
 
-async def receipt_get_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receipt_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Скасувати":
         return await cancel(update, context)
 
@@ -738,27 +642,23 @@ async def receipt_get_file(
 
     if not is_photo and not is_document:
         await update.message.reply_text(
-            "Надішліть фото накладної або файл PDF.",
+            "Надішліть фото накладної або PDF.",
             reply_markup=cancel_keyboard,
         )
         return RECEIPT_FILE
 
-    if is_document:
-        document = update.message.document
-
-        if document.mime_type != "application/pdf":
-            await update.message.reply_text(
-                "Потрібно надіслати фото або документ у форматі PDF.",
-                reply_markup=cancel_keyboard,
-            )
-            return RECEIPT_FILE
+    if is_document and update.message.document.mime_type != "application/pdf":
+        await update.message.reply_text(
+            "Потрібно надіслати фото або PDF.",
+            reply_markup=cancel_keyboard,
+        )
+        return RECEIPT_FILE
 
     row_number = context.user_data["receipt_row"]
     application_number = context.user_data["receipt_number"]
     obj = context.user_data["receipt_object"]
     materials = context.user_data["receipt_materials"]
     name = context.user_data["receipt_name"]
-
     received_time = get_current_time()
 
     caption = (
@@ -778,45 +678,20 @@ async def receipt_get_file(
             caption=caption,
         )
 
-        delivery_note_value = (
-            f"Telegram, повідомлення №{copied_message.message_id}"
-        )
-
-        worksheet.update_cell(
-            row_number,
-            COL_DELIVERED,
-            True,
-        )
-
-        worksheet.update_cell(
-            row_number,
-            COL_RECEIVED_DATE,
-            received_time,
-        )
-
+        worksheet.update_cell(row_number, COL_DELIVERED, True)
+        worksheet.update_cell(row_number, COL_RECEIVED_DATE, received_time)
         worksheet.update_cell(
             row_number,
             COL_DELIVERY_NOTE,
-            delivery_note_value,
+            f"Telegram, повідомлення №{copied_message.message_id}",
         )
+        worksheet.update_cell(row_number, COL_STATUS, "Доставлено")
 
-        worksheet.update_cell(
-            row_number,
-            COL_STATUS,
-            "Доставлено",
-        )
-
-        await update_group_message_by_row(
-            context,
-            row_number,
-        )
+        await update_group_message_by_row(context, row_number)
 
         await update.message.reply_text(
-            f"✅ Отримання товару за заявкою "
-            f"№{application_number} підтверджено.\n\n"
-            "Накладну відправлено в групу, "
-            "а в таблиці поставлено галочку «Доставлено».",
-            reply_markup=main_keyboard,
+            f"✅ Отримання товару за заявкою №{application_number} підтверджено.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
         )
 
     except Exception as error:
@@ -824,160 +699,464 @@ async def receipt_get_file(
 
         await update.message.reply_text(
             "❌ Не вдалося зберегти накладну або оновити таблицю.",
-            reply_markup=main_keyboard,
+            reply_markup=get_main_keyboard(update.effective_user.id),
         )
 
     context.user_data.clear()
-
     return ConversationHandler.END
 
 
-# ============================================================
-# СКАСУВАННЯ
-# ============================================================
+async def invoice_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
 
-async def cancel(
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text(
+            "⛔ У вас немає доступу до додавання рахунків.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+        return ConversationHandler.END
+
+    applications = get_open_applications()
+
+    if not applications:
+        await update.message.reply_text(
+            "Немає відкритих заявок для додавання рахунку.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+        return ConversationHandler.END
+
+    buttons = []
+
+    for application in applications:
+        materials = application["materials"].replace("\n", " ")
+
+        if len(materials) > 28:
+            materials = materials[:28] + "…"
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"№{application['number']} | {application['object']} | {materials}",
+                    callback_data=f"invoice_select:{clean_number(application['number'])}",
+                )
+            ]
+        )
+
+    await update.message.reply_text(
+        "🧾 Оберіть заявку:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+    return INVOICE_SELECT
+
+
+async def invoice_select_application(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    query = update.callback_query
+
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("У вас немає доступу.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+
+    application_number = query.data.split(":", 1)[1]
+    application = find_application_by_number(application_number)
+
+    if not application:
+        await query.edit_message_text("❌ Заявку не знайдено.")
+        return ConversationHandler.END
+
+    context.user_data["invoice_application_number"] = application["number"]
+    context.user_data["invoice_object"] = application["object"]
+    context.user_data["invoice_materials"] = application["materials"]
+    context.user_data["invoice_requester_id"] = application["user_id"]
+
+    await query.edit_message_text(
+        f"✅ Обрано заявку №{application['number']}\n"
+        f"🏗️ {application['object']}\n"
+        f"📦 {application['materials']}"
+    )
+
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🏪 Введіть назву постачальника:",
+        reply_markup=cancel_keyboard,
+    )
+
+    return INVOICE_SUPPLIER
+
+
+async def invoice_get_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    context.user_data["invoice_supplier"] = text
+
+    await update.message.reply_text(
+        "🔢 Введіть номер рахунку:",
+        reply_markup=cancel_keyboard,
+    )
+
+    return INVOICE_NUMBER
+
+
+async def invoice_get_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    context.user_data["invoice_document_number"] = text
+
+    await update.message.reply_text(
+        "💰 Введіть суму рахунку в гривнях.\n\n"
+        "Наприклад: 12500 або 12500,50",
+        reply_markup=cancel_keyboard,
+    )
+
+    return INVOICE_AMOUNT
+
+
+async def invoice_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    try:
+        amount = parse_amount(text)
+    except (InvalidOperation, ValueError):
+        await update.message.reply_text(
+            "❌ Суму не розпізнано. Введіть число ще раз.",
+            reply_markup=cancel_keyboard,
+        )
+        return INVOICE_AMOUNT
+
+    context.user_data["invoice_amount"] = str(amount)
+
+    await update.message.reply_text(
+        "📎 Надішліть фото рахунку або PDF.",
+        reply_markup=cancel_keyboard,
+    )
+
+    return INVOICE_FILE
+
+
+async def invoice_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    is_photo = bool(update.message.photo)
+    is_document = bool(update.message.document)
+
+    if not is_photo and not is_document:
+        await update.message.reply_text(
+            "Надішліть фото рахунку або PDF.",
+            reply_markup=cancel_keyboard,
+        )
+        return INVOICE_FILE
+
+    if is_document and update.message.document.mime_type != "application/pdf":
+        await update.message.reply_text(
+            "Потрібно надіслати фото або PDF.",
+            reply_markup=cancel_keyboard,
+        )
+        return INVOICE_FILE
+
+    application_number = context.user_data["invoice_application_number"]
+    obj = context.user_data["invoice_object"]
+    materials = context.user_data["invoice_materials"]
+    supplier = context.user_data["invoice_supplier"]
+    invoice_number = context.user_data["invoice_document_number"]
+    requester_id = context.user_data.get("invoice_requester_id", "")
+
+    amount = Decimal(context.user_data["invoice_amount"])
+    amount_text = amount_for_message(amount)
+
+    caption = (
+        f"🧾 РАХУНОК НА ПОГОДЖЕННЯ\n\n"
+        f"🔢 Заявка №{application_number}\n"
+        f"🏗️ Об'єкт: {obj}\n"
+        f"📦 Матеріали: {materials}\n"
+        f"🏪 Постачальник: {supplier}\n"
+        f"📄 Рахунок №{invoice_number}\n"
+        f"💰 Сума: {amount_text} грн\n\n"
+        f"📌 Статус: очікує погодження"
+    )
+
+    approval_keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Погодити",
+                    callback_data=f"invoice_approve:{clean_number(application_number)}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Відхилити",
+                    callback_data=f"invoice_reject:{clean_number(application_number)}",
+                ),
+            ]
+        ]
+    )
+
+    try:
+        await context.bot.copy_message(
+            chat_id=APPROVAL_GROUP_ID,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            caption=caption,
+            reply_markup=approval_keyboard,
+        )
+
+        application = find_application_by_number(application_number)
+
+        if not application:
+            raise RuntimeError("Заявку не знайдено під час запису рахунку.")
+
+        row_number = application["row_number"]
+
+        worksheet.update_cell(row_number, COL_SUPPLIER, supplier)
+        worksheet.update_cell(row_number, COL_INVOICE_NUMBER, invoice_number)
+        worksheet.update_cell(row_number, COL_AMOUNT, amount_for_sheet(amount))
+        worksheet.update_cell(row_number, COL_STATUS, "На погодженні")
+
+        await update_group_message_by_row(context, row_number)
+
+        await update.message.reply_text(
+            f"✅ Рахунок до заявки №{application_number} "
+            "відправлено керівнику.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+
+        if requester_id:
+            try:
+                requester_id_int = int(requester_id)
+
+                if requester_id_int != ADMIN_USER_ID:
+                    await context.bot.send_message(
+                        chat_id=requester_id_int,
+                        text=(
+                            f"🧾 До вашої заявки №{application_number} "
+                            "додано рахунок і передано керівнику."
+                        ),
+                        reply_markup=get_main_keyboard(requester_id_int),
+                    )
+            except (ValueError, TypeError):
+                pass
+
+    except Exception as error:
+        print(f"Помилка додавання рахунку: {error}")
+
+        await update.message.reply_text(
+            "❌ Не вдалося відправити рахунок або оновити таблицю.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def invoice_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if query.from_user.id != APPROVER_USER_ID:
+        await query.answer(
+            "⛔ Погоджувати рахунки може лише керівник.",
+            show_alert=True,
+        )
+        return
+
+    if query.message.chat_id != APPROVAL_GROUP_ID:
+        await query.answer(
+            "Ця дія доступна лише в групі погодження.",
+            show_alert=True,
+        )
+        return
+
+    action, application_number = query.data.split(":", 1)
+    application = find_application_by_number(application_number)
+
+    if not application:
+        await query.answer("Заявку не знайдено.", show_alert=True)
+        return
+
+    current_status = application["status"].strip().lower()
+
+    if current_status in {
+        "погоджено до оплати",
+        "відхилено",
+        "доставлено",
+    }:
+        await query.answer(
+            f"Рішення вже зафіксовано: {application['status']}.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    if action == "invoice_approve":
+        new_status = "Погоджено до оплати"
+        decision_text = "✅ ПОГОДЖЕНО КЕРІВНИКОМ"
+        notification = f"✅ Рахунок до заявки №{application['number']} погоджено."
+    else:
+        new_status = "Відхилено"
+        decision_text = "❌ ВІДХИЛЕНО КЕРІВНИКОМ"
+        notification = f"❌ Рахунок до заявки №{application['number']} відхилено."
+
+    try:
+        worksheet.update_cell(
+            application["row_number"],
+            COL_STATUS,
+            new_status,
+        )
+
+        await update_group_message_by_row(
+            context,
+            application["row_number"],
+        )
+
+        old_caption = query.message.caption or ""
+
+        await query.edit_message_caption(
+            caption=(
+                f"{old_caption}\n\n"
+                f"{decision_text}\n"
+                f"👤 {query.from_user.full_name}\n"
+                f"🕒 {get_current_time()}"
+            ),
+            reply_markup=None,
+        )
+
+        user_ids = {ADMIN_USER_ID}
+
+        try:
+            requester_id = int(application["user_id"])
+            if requester_id:
+                user_ids.add(requester_id)
+        except (ValueError, TypeError):
+            pass
+
+        for user_id in user_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=notification,
+                    reply_markup=get_main_keyboard(user_id),
+                )
+            except Exception as error:
+                print(f"Не вдалося сповістити {user_id}: {error}")
+
+    except Exception as error:
+        print(f"Помилка погодження рахунку: {error}")
+
+        await query.answer(
+            "Не вдалося зберегти рішення.",
+            show_alert=True,
+        )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
         "❌ Дію скасовано.",
-        reply_markup=main_keyboard,
+        reply_markup=get_main_keyboard(update.effective_user.id),
     )
 
     return ConversationHandler.END
 
 
-# ============================================================
-# ЗАПУСК
-# ============================================================
+async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"ID цього чату: {update.effective_chat.id}"
+    )
+
 
 app = Application.builder().token(TOKEN).build()
 
 conversation = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
-
-        MessageHandler(
-            filters.Regex(r"^➕ Нова заявка$"),
-            new_application,
-        ),
-
+        MessageHandler(filters.Regex(r"^➕ Нова заявка$"), new_application),
         MessageHandler(
             filters.Regex(r"^✏️ Редагувати останню заявку$"),
             edit_last_application,
         ),
-
-        MessageHandler(
-            filters.Regex(r"^📦 Товар отримано$"),
-            receipt_start,
-        ),
+        MessageHandler(filters.Regex(r"^📦 Товар отримано$"), receipt_start),
+        MessageHandler(filters.Regex(r"^🧾 Додати рахунок$"), invoice_start),
     ],
-
     states={
-        NAME: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                get_name,
-            )
-        ],
-
-        OBJECT: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                get_object,
-            )
-        ],
-
+        NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+        OBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_object)],
         MATERIALS: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                get_materials,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_materials)
         ],
-
-        COMMENT: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                get_comment,
-            )
-        ],
-
+        COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_comment)],
         EDIT_CHOICE: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                edit_choice,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, edit_choice)
         ],
-
         EDIT_OBJECT: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                save_edited_object,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_object)
         ],
-
         EDIT_MATERIALS: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                save_edited_materials,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_materials)
         ],
-
         EDIT_COMMENT: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                save_edited_comment,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, save_edited_comment)
         ],
-
         RECEIPT_NUMBER: [
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                receipt_get_number,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_get_number)
         ],
-
         RECEIPT_FILE: [
             MessageHandler(
-                (
-                    filters.PHOTO
-                    | filters.Document.ALL
-                    | filters.TEXT
-                )
+                (filters.PHOTO | filters.Document.ALL | filters.TEXT)
                 & ~filters.COMMAND,
                 receipt_get_file,
             )
         ],
+        INVOICE_SELECT: [
+            CallbackQueryHandler(
+                invoice_select_application,
+                pattern=r"^invoice_select:",
+            )
+        ],
+        INVOICE_SUPPLIER: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_get_supplier)
+        ],
+        INVOICE_NUMBER: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_get_number)
+        ],
+        INVOICE_AMOUNT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_get_amount)
+        ],
+        INVOICE_FILE: [
+            MessageHandler(
+                (filters.PHOTO | filters.Document.ALL | filters.TEXT)
+                & ~filters.COMMAND,
+                invoice_get_file,
+            )
+        ],
     },
-
-    fallbacks=[
-        CommandHandler("cancel", cancel)
-    ],
-
+    fallbacks=[CommandHandler("cancel", cancel)],
     allow_reentry=True,
 )
 
 app.add_handler(conversation)
 
-print("Бот запущено...")
-
-async def show_chat_id(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        f"ID цього чату: {update.effective_chat.id}"
-    )
-
-
-app.add_handler(conversation)
-
 app.add_handler(
-    CommandHandler("id", show_chat_id)
+    CallbackQueryHandler(
+        invoice_decision,
+        pattern=r"^invoice_(approve|reject):",
+    )
 )
+
+app.add_handler(CommandHandler("id", show_chat_id))
 
 print("Бот запущено...")
 
