@@ -964,4 +964,21 @@ app.add_handler(conversation)
 
 print("Бот запущено...")
 
+async def show_chat_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        f"ID цього чату: {update.effective_chat.id}"
+    )
+
+
+app.add_handler(conversation)
+
+app.add_handler(
+    CommandHandler("id", show_chat_id)
+)
+
+print("Бот запущено...")
+
 app.run_polling()
