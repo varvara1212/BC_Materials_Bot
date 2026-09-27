@@ -771,152 +771,79 @@ async def invoice_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        buttons = []
+        keyboard = []
         context.user_data["invoice_application_rows"] = {}
 
         for application in applications:
-            materials = application["materials"].replace("\n", " ")
-
-            if len(materials) > 28:
-                materials = materials[:28] + "…"
-
             application_number = clean_number(application["number"])
+            label = f"№{application_number} | {application['object']}"
+            context.user_data["invoice_application_rows"][label] = application["row_number"]
+            keyboard.append([label])
 
-            context.user_data["invoice_application_rows"][
-                application_number
-            ] = application["row_number"]
-
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"№{application_number} | "
-                        f"{application['object']} | {materials}",
-                        callback_data=f"invoice_select:{application_number}",
-                    )
-                ]
-            )
+        keyboard.append(["❌ Скасувати"])
 
         await update.message.reply_text(
             "🧾 Оберіть заявку:",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
         )
-
         return INVOICE_SELECT
 
     except Exception as error:
         print(f"Помилка відкриття списку заявок: {error}")
-
         await update.message.reply_text(
             "❌ Не вдалося отримати список заявок.",
             reply_markup=get_main_keyboard(update.effective_user.id),
         )
-
         context.user_data.clear()
         return ConversationHandler.END
 
 
-async def invoice_select_application(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
+async def invoice_select_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Скасувати":
+        return await cancel(update, context)
+
+    application_rows = context.user_data.get("invoice_application_rows", {})
+    row_number = application_rows.get(text)
+
+    if not row_number:
+        await update.message.reply_text(
+            "❌ Оберіть заявку кнопкою зі списку нижче."
+        )
+        return INVOICE_SELECT
 
     try:
-        if query.from_user.id != ADMIN_USER_ID:
-            await query.answer(
-                "⛔ У вас немає доступу.",
-                show_alert=True,
-            )
-            return ConversationHandler.END
-
-        # Одразу прибираємо "крутилку" після натискання кнопки
-        await query.answer()
-
-        application_number = clean_number(
-            query.data.split(":", 1)[1]
-        )
-
-        application_rows = context.user_data.get(
-            "invoice_application_rows",
-            {}
-        )
-
-        row_number = application_rows.get(application_number)
-
-        if not row_number:
-            await query.edit_message_text(
-                "❌ Не вдалося знайти рядок заявки.\n\n"
-                "Відкрийте «🧾 Додати рахунок» ще раз."
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        # Читаємо конкретний рядок Google Таблиці
         row = worksheet.row_values(row_number)
-
         while len(row) < COL_REQUIRED_DELIVERY_DATE:
             row.append("")
 
-        saved_number = clean_number(row[COL_NUMBER - 1])
+        context.user_data["invoice_application_number"] = row[COL_NUMBER - 1]
+        context.user_data["invoice_object"] = row[COL_OBJECT - 1]
+        context.user_data["invoice_materials"] = row[COL_MATERIALS - 1]
+        context.user_data["invoice_requester_id"] = row[COL_USER_ID - 1]
 
-        if saved_number != application_number:
-            await query.edit_message_text(
-                "❌ Заявку не знайдено в таблиці."
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        # Зберігаємо всі потрібні дані заявки
-        context.user_data["invoice_application_number"] = row[
-            COL_NUMBER - 1
-        ]
-        context.user_data["invoice_object"] = row[
-            COL_OBJECT - 1
-        ]
-        context.user_data["invoice_materials"] = row[
-            COL_MATERIALS - 1
-        ]
-        context.user_data["invoice_requester_id"] = row[
-            COL_USER_ID - 1
-        ]
-
-        # Показуємо вибрану заявку
-        await query.edit_message_text(
+        await update.message.reply_text(
             f"✅ Обрано заявку №{row[COL_NUMBER - 1]}\n\n"
             f"🏗️ {row[COL_OBJECT - 1]}\n"
             f"📦 {row[COL_MATERIALS - 1]}"
         )
-
-        # Переходимо до введення постачальника
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="🏪 Введіть назву постачальника:",
+        await update.message.reply_text(
+            "🏪 Введіть назву постачальника:",
             reply_markup=cancel_keyboard,
         )
-
         return INVOICE_SUPPLIER
 
     except Exception as error:
         print(f"Помилка вибору заявки для рахунку: {error}")
-
-        try:
-            await query.answer(
-                "❌ Сталася помилка. Спробуйте ще раз.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
-
-        try:
-            await query.edit_message_text(
-                "❌ Не вдалося вибрати заявку.\n\n"
-                "Спробуйте ще раз через «🧾 Додати рахунок»."
-            )
-        except Exception as edit_error:
-            print(
-                f"Помилка редагування повідомлення: {edit_error}"
-            )
-
+        await update.message.reply_text(
+            "❌ Не вдалося вибрати заявку. Спробуйте ще раз.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -1300,10 +1227,7 @@ conversation = ConversationHandler(
             )
         ],
         INVOICE_SELECT: [
-            CallbackQueryHandler(
-                invoice_select_application,
-                pattern=r"^invoice_select:",
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_select_application)
         ],
         INVOICE_SUPPLIER: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_get_supplier)
