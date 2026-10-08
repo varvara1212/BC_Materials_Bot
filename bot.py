@@ -1014,6 +1014,7 @@ async def invoice_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def invoice_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    print("APPROVAL: обробник погодження викликано", flush=True)
 
     if query.from_user.id != APPROVER_USER_ID:
         await query.answer("⛔ Погоджувати рахунки може лише керівник.", show_alert=True)
@@ -1142,6 +1143,20 @@ async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def log_button_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    print(
+        f"BUTTON: data={query.data!r}; "
+        f"director_match={query.from_user.id == APPROVER_USER_ID}; "
+        f"approval_chat_match={bool(query.message and query.message.chat_id == APPROVAL_GROUP_ID)}",
+        flush=True,
+    )
+
+
+async def log_bot_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"BOT ERROR: {type(context.error).__name__}: {context.error}", flush=True)
+
+
 app = Application.builder().token(TOKEN).build()
 
 conversation = ConversationHandler(
@@ -1214,6 +1229,9 @@ conversation = ConversationHandler(
     allow_reentry=True,
 )
 
+app.add_handler(CallbackQueryHandler(log_button_event), group=-1)
+app.add_error_handler(log_bot_error)
+
 app.add_handler(
     CallbackQueryHandler(
         invoice_decision,
@@ -1225,6 +1243,6 @@ app.add_handler(conversation)
 
 app.add_handler(CommandHandler("id", show_chat_id))
 
-print("Бот запущено...")
+print("Бот запущено: версія buttons-v2", flush=True)
 
-app.run_polling()
+app.run_polling(allowed_updates=Update.ALL_TYPES)
