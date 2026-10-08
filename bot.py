@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -761,91 +762,77 @@ async def invoice_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    try:
-        applications = get_open_applications()
+    applications = get_open_applications()
 
-        if not applications:
-            await update.message.reply_text(
-                "Немає відкритих заявок для додавання рахунку.",
-                reply_markup=get_main_keyboard(update.effective_user.id),
-            )
-            return ConversationHandler.END
-
-        keyboard = []
-        context.user_data["invoice_application_rows"] = {}
-
-        for application in applications:
-            application_number = clean_number(application["number"])
-            label = f"№{application_number} | {application['object']}"
-            context.user_data["invoice_application_rows"][label] = application["row_number"]
-            keyboard.append([label])
-
-        keyboard.append(["❌ Скасувати"])
-
+    if not applications:
         await update.message.reply_text(
-            "🧾 Оберіть заявку:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard,
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-        )
-        return INVOICE_SELECT
-
-    except Exception as error:
-        print(f"Помилка відкриття списку заявок: {error}")
-        await update.message.reply_text(
-            "❌ Не вдалося отримати список заявок.",
+            "Немає відкритих заявок для додавання рахунку.",
             reply_markup=get_main_keyboard(update.effective_user.id),
         )
-        context.user_data.clear()
         return ConversationHandler.END
 
+    buttons = []
 
-async def invoice_select_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    for application in applications:
+        materials = application["materials"].replace("\n", " ")
 
-    if text == "❌ Скасувати":
-        return await cancel(update, context)
+        if len(materials) > 28:
+            materials = materials[:28] + "…"
 
-    application_rows = context.user_data.get("invoice_application_rows", {})
-    row_number = application_rows.get(text)
-
-    if not row_number:
-        await update.message.reply_text(
-            "❌ Оберіть заявку кнопкою зі списку нижче."
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"№{application['number']} | {application['object']} | {materials}",
+                    callback_data=f"invoice_select:{clean_number(application['number'])}",
+                )
+            ]
         )
-        return INVOICE_SELECT
 
-    try:
-        row = worksheet.row_values(row_number)
-        while len(row) < COL_REQUIRED_DELIVERY_DATE:
-            row.append("")
+    await update.message.reply_text(
+        "🧾 Оберіть заявку:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
-        context.user_data["invoice_application_number"] = row[COL_NUMBER - 1]
-        context.user_data["invoice_object"] = row[COL_OBJECT - 1]
-        context.user_data["invoice_materials"] = row[COL_MATERIALS - 1]
-        context.user_data["invoice_requester_id"] = row[COL_USER_ID - 1]
+    return INVOICE_SELECT
 
-        await update.message.reply_text(
-            f"✅ Обрано заявку №{row[COL_NUMBER - 1]}\n\n"
-            f"🏗️ {row[COL_OBJECT - 1]}\n"
-            f"📦 {row[COL_MATERIALS - 1]}"
-        )
-        await update.message.reply_text(
-            "🏪 Введіть назву постачальника:",
-            reply_markup=cancel_keyboard,
-        )
-        return INVOICE_SUPPLIER
 
-    except Exception as error:
-        print(f"Помилка вибору заявки для рахунку: {error}")
-        await update.message.reply_text(
-            "❌ Не вдалося вибрати заявку. Спробуйте ще раз.",
-            reply_markup=get_main_keyboard(update.effective_user.id),
-        )
-        context.user_data.clear()
+async def invoice_select_application(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("У вас немає доступу.", show_alert=True)
         return ConversationHandler.END
+
+    await query.answer()
+
+    application_number = query.data.split(":", 1)[1]
+    application = find_application_by_number(application_number)
+
+    if not application:
+        await query.edit_message_text("❌ Заявку не знайдено.")
+        return ConversationHandler.END
+
+    context.user_data["invoice_application_number"] = application["number"]
+    context.user_data["invoice_object"] = application["object"]
+    context.user_data["invoice_materials"] = application["materials"]
+    context.user_data["invoice_requester_id"] = application["user_id"]
+
+    await query.edit_message_text(
+        f"✅ Обрано заявку №{application['number']}\n"
+        f"🏗️ {application['object']}\n"
+        f"📦 {application['materials']}"
+    )
+
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🏪 Введіть назву постачальника:",
+        reply_markup=cancel_keyboard,
+    )
+
+    return INVOICE_SUPPLIER
 
 
 async def invoice_get_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1029,123 +1016,112 @@ async def invoice_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
     if query.from_user.id != APPROVER_USER_ID:
-        await query.answer(
-            "⛔ Погоджувати рахунки може лише керівник.",
-            show_alert=True,
-        )
+        await query.answer("⛔ Погоджувати рахунки може лише керівник.", show_alert=True)
         return
-
     if query.message.chat_id != APPROVAL_GROUP_ID:
-        await query.answer(
-            "Ця дія доступна лише в групі погодження.",
-            show_alert=True,
-        )
+        await query.answer("Ця дія доступна лише в групі погодження.", show_alert=True)
         return
 
-    action, application_number = query.data.split(":", 1)
-    application = find_application_by_number(application_number)
-
-    if not application:
-        await query.answer("Заявку не знайдено.", show_alert=True)
-        return
-
-    current_status = application["status"].strip().lower()
-
-    if current_status in {
-        "погоджено до оплати",
-        "відхилено",
-        "доставлено",
-    }:
-        await query.answer(
-            f"Рішення вже зафіксовано: {application['status']}.",
-            show_alert=True,
-        )
-        return
-
+    # Answer before Google requests: Telegram callback queries expire quickly.
     await query.answer()
+    action, application_number = query.data.split(":", 1)
 
-    if action == "invoice_approve":
-        new_status = "Погоджено до оплати"
-        decision_text = "✅ ПОГОДЖЕНО КЕРІВНИКОМ"
-        notification = f"✅ Рахунок до заявки №{application['number']} погоджено."
-    else:
-        new_status = "Відхилено"
-        decision_text = "❌ ВІДХИЛЕНО КЕРІВНИКОМ"
-        notification = f"❌ Рахунок до заявки №{application['number']} відхилено."
+    async def report_error(text):
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text)
 
     try:
-        worksheet.update_cell(
-            application["row_number"],
-            COL_STATUS,
-            new_status,
-        )
+        application = await asyncio.to_thread(find_application_by_number, application_number)
+        if not application:
+            await report_error("❌ Заявку не знайдено в таблиці.")
+            return
 
-        await update_group_message_by_row(
-            context,
-            application["row_number"],
+        status = application["status"].strip().lower()
+        # An old version could save approval without sending the payment copy.
+        # If its button is still present, allow recovery of that interrupted action.
+        if status == "доставлено":
+            await report_error(f"Заявка №{application_number} вже доставлена.")
+            return
+        if status in {"погоджено до оплати", "відхилено"} and not query.message.reply_markup:
+            await report_error(f"Рішення вже зафіксовано: {application['status']}.")
+            return
+
+        approved = action == "invoice_approve"
+        new_status = "Погоджено до оплати" if approved else "Відхилено"
+        decision_text = "✅ ПОГОДЖЕНО КЕРІВНИКОМ" if approved else "❌ ВІДХИЛЕНО КЕРІВНИКОМ"
+        notification = (
+            f"✅ Рахунок до заявки №{application['number']} погоджено."
+            if approved else f"❌ Рахунок до заявки №{application['number']} відхилено."
         )
+        # The intermediate status records a successful payment copy so retries
+        # after a Sheets or Telegram editing failure do not copy it again.
+        sent_status = "Рахунок передано до оплати"
+        if status == sent_status.lower() and not approved:
+            await report_error("Рахунок уже передано до оплати. Завершіть погодження.")
+            return
+
+        if approved and status != sent_status.lower():
+            payment_caption = (
+                "💳 ДО ОПЛАТИ\n\n"
+                + (query.message.caption or f"Заявка №{application_number}")
+                .replace("📌 Статус: очікує погодження", "✅ Погоджено керівником")
+            )[:1024]
+            # Do not mark the request as approved if delivery to payment fails.
+            try:
+                await context.bot.copy_message(
+                    chat_id=PAYMENT_GROUP_ID,
+                    from_chat_id=APPROVAL_GROUP_ID,
+                    message_id=query.message.message_id,
+                    caption=payment_caption,
+                )
+            except Exception as error:
+                print(f"Помилка передачі рахунку до оплати: {error}")
+                await report_error(
+                    f"❌ Рахунок до заявки №{application_number} не передано в групу оплати. "
+                    "Перевірте PAYMENT_GROUP_ID у Railway і чи бот має право надсилати "
+                    "повідомлення в цю групу. Після виправлення натисніть «Погодити» ще раз."
+                )
+                return
+            try:
+                await asyncio.to_thread(worksheet.update_cell, application["row_number"], COL_STATUS, sent_status)
+            except Exception as error:
+                print(f"Рахунок відправлено, але проміжний статус не збережено: {error}")
+                # Remove buttons to avoid a duplicate payment copy on a retry.
+                await query.edit_message_reply_markup(reply_markup=None)
+                await report_error(
+                    f"⚠️ Рахунок №{application_number} передано до оплати, але таблицю "
+                    "не вдалося оновити. Перевірте групу оплати та внесіть статус у таблицю."
+                )
+                return
 
         old_caption = query.message.caption or ""
-
-        final_caption = (
-            f"{old_caption}\n\n"
-            f"{decision_text}\n"
-            f"👤 {query.from_user.full_name}\n"
-            f"🕒 {get_current_time()}"
-        )
-
-        if action == "invoice_approve":
-            payment_caption = (
-                f"💳 ДО ОПЛАТИ\n\n"
-                f"🔢 Заявка №{application['number']}\n"
-                f"🏗️ Об'єкт: {application['object']}\n"
-                f"📦 Матеріали: {application['materials']}\n"
-                f"📅 Потрібна доставка: "
-                f"{application['required_delivery_date'] or 'Не вказано'}\n"
-                f"🏪 Постачальник: {application['supplier']}\n"
-                f"📄 Рахунок №{application['invoice_number']}\n"
-                f"💰 Сума: {application['amount']} грн\n\n"
-                f"✅ Погоджено керівником\n"
-                f"🕒 {get_current_time()}"
-            )
-
-            await context.bot.copy_message(
-                chat_id=PAYMENT_GROUP_ID,
-                from_chat_id=APPROVAL_GROUP_ID,
-                message_id=query.message.message_id,
-                caption=payment_caption,
-            )
-
-        await query.edit_message_caption(
-            caption=final_caption,
-            reply_markup=None,
-        )
+        old_caption = old_caption.replace("📌 Статус: очікує погодження", f"📌 Статус: {new_status}")
+        suffix = f"\n\n{decision_text}\n👤 {query.from_user.full_name}\n🕒 {get_current_time()}"
+        final_caption = old_caption[:1024 - len(suffix)] + suffix
+        # Keep buttons available if the final table update fails.
+        await asyncio.to_thread(worksheet.update_cell, application["row_number"], COL_STATUS, new_status)
+        await query.edit_message_caption(caption=final_caption, reply_markup=None)
+        await update_group_message_by_row(context, application["row_number"])
 
         user_ids = {ADMIN_USER_ID}
-
         try:
             requester_id = int(application["user_id"])
             if requester_id:
                 user_ids.add(requester_id)
         except (ValueError, TypeError):
             pass
-
         for user_id in user_ids:
             try:
                 await context.bot.send_message(
-                    chat_id=user_id,
-                    text=notification,
+                    chat_id=user_id, text=notification,
                     reply_markup=get_main_keyboard(user_id),
                 )
             except Exception as error:
                 print(f"Не вдалося сповістити {user_id}: {error}")
-
     except Exception as error:
         print(f"Помилка погодження рахунку: {error}")
-
-        await query.answer(
-            "Не вдалося зберегти рішення.",
-            show_alert=True,
+        await report_error(
+            f"❌ Не вдалося завершити рішення щодо заявки №{application_number}. "
+            "Перевірте журнал Railway. Якщо кнопки залишились, повторіть натискання."
         )
 
 
@@ -1166,22 +1142,7 @@ async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def delete_webhook_before_polling(application):
-    # Telegram does not allow getUpdates (polling) while a webhook is active.
-    # Remove any old webhook automatically before the bot starts polling.
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook видалено. Бот запускається через polling.")
-    except Exception as error:
-        print(f"Не вдалося видалити webhook: {error}")
-
-
-app = (
-    Application.builder()
-    .token(TOKEN)
-    .post_init(delete_webhook_before_polling)
-    .build()
-)
+app = Application.builder().token(TOKEN).build()
 
 conversation = ConversationHandler(
     entry_points=[
@@ -1227,7 +1188,10 @@ conversation = ConversationHandler(
             )
         ],
         INVOICE_SELECT: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_select_application)
+            CallbackQueryHandler(
+                invoice_select_application,
+                pattern=r"^invoice_select:",
+            )
         ],
         INVOICE_SUPPLIER: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_get_supplier)
@@ -1250,14 +1214,14 @@ conversation = ConversationHandler(
     allow_reentry=True,
 )
 
-app.add_handler(conversation)
-
 app.add_handler(
     CallbackQueryHandler(
         invoice_decision,
         pattern=r"^invoice_(approve|reject):",
     )
 )
+
+app.add_handler(conversation)
 
 app.add_handler(CommandHandler("id", show_chat_id))
 
